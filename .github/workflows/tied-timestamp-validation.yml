@@ -42,7 +42,7 @@ jobs:
           mkdir -p validation-results
           set -o pipefail
           tox -e '${{ matrix.tox }}' \
-            --override 'testenv.uv_sync_flags=--no-install-package lancedb' \
+            --override 'testenv.uv_sync_flags=--no-install-package=lancedb' \
             --override 'testenv.commands=pytest tests/unittests -n auto --junitxml=validation-results/full.xml' \
             | tee validation-results/tox.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
