@@ -1,0 +1,128 @@
+name: Tied-timestamp regression validation
+
+on:
+  push:
+    branches: [validation/tied-timestamp-oct10]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UV_EXCLUDE_NEWER: '2026-10-10T09:00:00Z'
+
+jobs:
+  full-unit-suite:
+    name: Full tox suite (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: '3.11'
+            tox: py311
+          - python: '3.12'
+            tox: py312
+          - python: '3.13'
+            tox: py313
+          - python: '3.14'
+            tox: py314
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+      - run: |
+          uv python install '${{ matrix.python }}'
+          uv lock --python '${{ matrix.python }}'
+          uv tool install tox --with tox-uv
+      - name: Run every unit test through tox
+        run: |
+          mkdir -p validation-results
+          set -o pipefail
+          tox -e '${{ matrix.tox }}' \
+            --override 'testenv.uv_sync_flags=--no-install-package lancedb' \
+            --override 'testenv.commands=pytest tests/unittests -n auto --junitxml=validation-results/full.xml' \
+            | tee validation-results/tox.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: full-${{ matrix.tox }}
+          path: validation-results
+
+  quality:
+    name: Hooks, types, wheel and negative controls
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+      - run: |
+          uv python install 3.12
+          uv sync --python 3.12 --all-extras --no-install-package lancedb
+          mkdir -p validation-results
+      - name: Confirm the exact five failures without xfail
+        run: |
+          set +e
+          uv run --no-sync pytest tests/unittests/sessions/test_session_service.py \
+            -q -k database_fresh --runxfail \
+            --junitxml=validation-results/unmasked.xml > validation-results/unmasked.log 2>&1
+          result=$?
+          cat validation-results/unmasked.log
+          test "$result" -eq 1 || exit 1
+          uv run --no-sync python - <<'PY'
+          import xml.etree.ElementTree as ET
+          cases = ET.parse('validation-results/unmasked.xml').findall('.//testcase')
+          failures = [c for c in cases if c.find('failure') is not None]
+          assert len(cases) == 12 and len(failures) == 5
+          assert all('AssertionError' in c.find('failure').get('message') for c in failures)
+          assert any('same_timestamp' in c.get('name') and 'invalidate the stale session' in c.find('failure').get('message') for c in failures)
+          for limit in ('None', '1', '5', '100'):
+              assert any(f'[{limit}-True]' in c.get('name') for c in failures)
+          print('Confirmed exactly five expected behavioral assertion failures.')
+          PY
+      - name: Compare mypy with the unmodified base
+        run: |
+          set +e
+          uv run --no-sync mypy . > validation-results/mypy-current.log 2>&1
+          current_status=$?
+          git worktree add --detach "$RUNNER_TEMP/adk-baseline" 3c31fa5100a617d03a19f8a9495b8b93d2e47628
+          (cd "$RUNNER_TEMP/adk-baseline" && "$GITHUB_WORKSPACE/.venv/bin/python" -m mypy .) > validation-results/mypy-baseline.log 2>&1
+          baseline_status=$?
+          test "$current_status" -le 1 && test "$baseline_status" -le 1 || exit 1
+          grep 'error:' validation-results/mypy-current.log | sed 's/:[0-9]\+:/::/g' | sort > validation-results/current-errors.txt
+          grep 'error:' validation-results/mypy-baseline.log | sed 's/:[0-9]\+:/::/g' | sort > validation-results/baseline-errors.txt
+          comm -13 validation-results/baseline-errors.txt validation-results/current-errors.txt > validation-results/new-errors.txt
+          cat validation-results/new-errors.txt
+          test ! -s validation-results/new-errors.txt
+      - name: Build and probe an installed wheel
+        run: |
+          uv build
+          uv venv "$RUNNER_TEMP/wheel-probe" --python 3.12
+          uv pip install --python "$RUNNER_TEMP/wheel-probe/bin/python" dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/wheel-probe/bin/python" - <<'PY'
+          import importlib.metadata as metadata
+          from google.adk.sessions import InMemorySessionService
+          service = InMemorySessionService()
+          session = service.create_session_sync(app_name='wheel_probe', user_id='user')
+          assert service.get_session_sync(app_name='wheel_probe', user_id='user', session_id=session.id) is not None
+          print('Installed wheel:', metadata.version('google-adk'))
+          PY
+      - name: Run all repository hooks
+        if: always()
+        run: |
+          set -o pipefail
+          uv run --no-sync pre-commit run --all-files 2>&1 | tee validation-results/precommit.log
+      - name: Record any hook changes
+        if: always()
+        run: git diff > validation-results/precommit.patch
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: quality
+          path: validation-results
